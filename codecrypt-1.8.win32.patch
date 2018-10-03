@@ -1,0 +1,411 @@
+diff -Naur codecrypt-1.8-stock/src/flock.c codecrypt-1.8/src/flock.c
+--- codecrypt-1.8-stock/src/flock.c	1969-12-31 16:00:00 -0800
++++ codecrypt-1.8/src/flock.c	2018-09-15 02:33:34 -0700
+@@ -0,0 +1,220 @@
++/* Emulate flock on platforms that lack it, primarily Windows and MinGW.
++
++   This is derived from sqlite3 sources.
++   http://www.sqlite.org/cvstrac/rlog?f=sqlite/src/os_win.c
++   http://www.sqlite.org/copyright.html
++
++   Written by Richard W.M. Jones <rjones.at.redhat.com>
++
++   Copyright (C) 2008-2012 Free Software Foundation, Inc.
++
++   This library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   This library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++//#include <config.h>
++#include <sys/file.h>
++
++#if (defined _WIN32 || defined __WIN32__) && ! defined __CYGWIN__
++
++/* LockFileEx */
++# define WIN32_LEAN_AND_MEAN
++# include <windows.h>
++
++# include <errno.h>
++
++/* _get_osfhandle */
++//# include "msvc-nothrow.h"
++
++/* Determine the current size of a file.  Because the other braindead
++ * APIs we'll call need lower/upper 32 bit pairs, keep the file size
++ * like that too.
++ */
++static BOOL
++file_size (HANDLE h, DWORD * lower, DWORD * upper)
++{
++  *lower = GetFileSize (h, upper);
++  return 1;
++}
++
++/* LOCKFILE_FAIL_IMMEDIATELY is undefined on some Windows systems. */
++# ifndef LOCKFILE_FAIL_IMMEDIATELY
++#  define LOCKFILE_FAIL_IMMEDIATELY 1
++# endif
++
++/* Acquire a lock. */
++static BOOL
++do_lock (HANDLE h, int non_blocking, int exclusive)
++{
++  BOOL res;
++  DWORD size_lower, size_upper;
++  OVERLAPPED ovlp;
++  int flags = 0;
++
++  /* We're going to lock the whole file, so get the file size. */
++  res = file_size (h, &size_lower, &size_upper);
++  if (!res)
++    return 0;
++
++  /* Start offset is 0, and also zero the remaining members of this struct. */
++  memset (&ovlp, 0, sizeof ovlp);
++
++  if (non_blocking)
++    flags |= LOCKFILE_FAIL_IMMEDIATELY;
++  if (exclusive)
++    flags |= LOCKFILE_EXCLUSIVE_LOCK;
++
++  return LockFileEx (h, flags, 0, size_lower, size_upper, &ovlp);
++}
++
++/* Unlock reader or exclusive lock. */
++static BOOL
++do_unlock (HANDLE h)
++{
++  int res;
++  DWORD size_lower, size_upper;
++
++  res = file_size (h, &size_lower, &size_upper);
++  if (!res)
++    return 0;
++
++  return UnlockFile (h, 0, 0, size_lower, size_upper);
++}
++
++/* Now our BSD-like flock operation. */
++int
++flock (int fd, int operation)
++{
++  HANDLE h = (HANDLE) _get_osfhandle (fd);
++  DWORD res;
++  int non_blocking;
++
++  if (h == INVALID_HANDLE_VALUE)
++    {
++      errno = EBADF;
++      return -1;
++    }
++
++  non_blocking = operation & LOCK_NB;
++  operation &= ~LOCK_NB;
++
++  switch (operation)
++    {
++    case LOCK_SH:
++      res = do_lock (h, non_blocking, 0);
++      break;
++    case LOCK_EX:
++      res = do_lock (h, non_blocking, 1);
++      break;
++    case LOCK_UN:
++      res = do_unlock (h);
++      break;
++    default:
++      errno = EINVAL;
++      return -1;
++    }
++
++  /* Map Windows errors into Unix errnos.  As usual MSDN fails to
++   * document the permissible error codes.
++   */
++  if (!res)
++    {
++      DWORD err = GetLastError ();
++      switch (err)
++        {
++          /* This means someone else is holding a lock. */
++        case ERROR_LOCK_VIOLATION:
++          errno = EAGAIN;
++          break;
++
++          /* Out of memory. */
++        case ERROR_NOT_ENOUGH_MEMORY:
++          errno = ENOMEM;
++          break;
++
++        case ERROR_BAD_COMMAND:
++          errno = EINVAL;
++          break;
++
++          /* Unlikely to be other errors, but at least don't lose the
++           * error code.
++           */
++        default:
++          errno = err;
++        }
++
++      return -1;
++    }
++
++  return 0;
++}
++
++#else /* !Windows */
++
++# ifdef HAVE_STRUCT_FLOCK_L_TYPE
++/* We know how to implement flock in terms of fcntl. */
++
++#  include <fcntl.h>
++
++#  ifdef HAVE_UNISTD_H
++#   include <unistd.h>
++#  endif
++
++#  include <errno.h>
++#  include <string.h>
++
++int
++flock (int fd, int operation)
++{
++  int cmd, r;
++  struct flock fl;
++
++  if (operation & LOCK_NB)
++    cmd = F_SETLK;
++  else
++    cmd = F_SETLKW;
++  operation &= ~LOCK_NB;
++
++  memset (&fl, 0, sizeof fl);
++  fl.l_whence = SEEK_SET;
++  /* l_start & l_len are 0, which as a special case means "whole file". */
++
++  switch (operation)
++    {
++    case LOCK_SH:
++      fl.l_type = F_RDLCK;
++      break;
++    case LOCK_EX:
++      fl.l_type = F_WRLCK;
++      break;
++    case LOCK_UN:
++      fl.l_type = F_UNLCK;
++      break;
++    default:
++      errno = EINVAL;
++      return -1;
++    }
++
++  r = fcntl (fd, cmd, &fl);
++  if (r == -1 && errno == EACCES)
++    errno = EAGAIN;
++
++  return r;
++}
++
++# else /* !HAVE_STRUCT_FLOCK_L_TYPE */
++
++#  error "This platform lacks flock function, and Gnulib doesn't provide a replacement. This is a bug in Gnulib."
++
++# endif /* !HAVE_STRUCT_FLOCK_L_TYPE */
++
++#endif /* !Windows */
+diff -Naur codecrypt-1.8-stock/src/flock.h codecrypt-1.8/src/flock.h
+--- codecrypt-1.8-stock/src/flock.h	1969-12-31 16:00:00 -0800
++++ codecrypt-1.8/src/flock.h	2018-09-15 02:32:02 -0700
+@@ -0,0 +1,6 @@
++#define LOCK_SH         1       /* shared lock */
++#define LOCK_EX         2       /* exclusive lock */
++#define LOCK_NB         4       /* or'd with one of the above to prevent
++                                   blocking */
++#define LOCK_UN         8       /* remove lock */
++
+diff -Naur codecrypt-1.8-stock/src/generator.cpp codecrypt-1.8/src/generator.cpp
+--- codecrypt-1.8-stock/src/generator.cpp	2017-06-26 05:25:24 -0700
++++ codecrypt-1.8/src/generator.cpp	2018-09-27 00:22:37 -0700
+@@ -32,6 +32,43 @@
+ 	return (bits >> 3) + ( (bits & 7) ? 1 : 0);
+ }
+ 
++#if defined(_WIN32)
++// https://gist.github.com/kbjorklu/6317361
++#include <iostream>
++#include <windows.h>
++#include <Wincrypt.h>
++#pragma comment(lib, "advapi32.lib")
++bool ccr_rng::seed (uint bits, bool quick)
++{
++	std::vector<byte> s;
++	std::ifstream f;
++
++	uint b = bytes (bits);
++	if (b > 256) b = 256;
++
++	HCRYPTPROV hProvider = 0;
++
++	if (!::CryptAcquireContextW(&hProvider, 0, 0, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
++		return false;
++
++	BYTE pbBuffer[256] = {};
++	DWORD dwLength = b;
++	if (!::CryptGenRandom(hProvider, dwLength, pbBuffer))
++	{
++		::CryptReleaseContext(hProvider, 0);
++		return false;
++	}
++	//for (DWORD i = 0; i < dwLength; ++i)
++	//	std::cerr << std::hex << static_cast<unsigned int>(pbBuffer[i]) << std::endl;
++
++	s.resize (b);
++	for (uint i = 0; i < b; ++i) s[i] = pbBuffer[i];
++	::CryptReleaseContext(hProvider, 0);
++
++	r.load_key_vector (s);
++	return true;
++}
++#else
+ bool ccr_rng::seed (uint bits, bool quick)
+ {
+ 	std::vector<byte> s;
+@@ -58,4 +95,4 @@
+ 	r.load_key_vector (s);
+ 	return true;
+ }
+-
++#endif
+diff -Naur codecrypt-1.8-stock/src/keyring.cpp codecrypt-1.8/src/keyring.cpp
+--- codecrypt-1.8-stock/src/keyring.cpp	2017-10-23 05:38:36 -0700
++++ codecrypt-1.8/src/keyring.cpp	2018-09-28 00:48:17 -0700
+@@ -18,6 +18,10 @@
+  * along with Codecrypt. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#if defined(_WIN32)
++#include "flock.h"
++#include "flock.c"
++#endif
+ #include "keyring.h"
+ 
+ void keyring::clear()
+diff -Naur codecrypt-1.8-stock/src/main.cpp codecrypt-1.8/src/main.cpp
+--- codecrypt-1.8-stock/src/main.cpp	2017-10-23 05:51:28 -0700
++++ codecrypt-1.8/src/main.cpp	2018-09-28 00:29:51 -0700
+@@ -19,6 +19,12 @@
+  */
+ 
+ #include "iohelpers.h"
++#if defined(_WIN32)
++#include <stdio.h>
++#include <io.h>
++#include <fcntl.h>
++#endif
++
+ 
+ void print_version()
+ {
+@@ -356,12 +362,23 @@
+ 		exitval = 1;
+ 		goto exit;
+ 	}
++	#if defined(_WIN32)
++	else {
++		_setmode (STDIN_FILENO, _O_BINARY); 
++	}
++	#endif
+ 
+ 	if (output.length() && !redirect_cout (output)) {
+ 		progerr ("could not redirect to output file");
+ 		exitval = 1;
+ 		goto exit;
+ 	}
++	#if defined(_WIN32)
++	else {
++// https://stackoverflow.com/questions/30969205/force-c-to-readin-stdin-as-binary-using-mingw
++		_setmode (STDOUT_FILENO, _O_BINARY);
++	}
++	#endif
+ 
+ 	if (err_output.length() && !redirect_cerr (err_output)) {
+ 		progerr ("could not redirect to error output file");
+diff -Naur codecrypt-1.8-stock/src/pwrng.cpp codecrypt-1.8/src/pwrng.cpp
+--- codecrypt-1.8-stock/src/pwrng.cpp	2017-10-23 05:38:36 -0700
++++ codecrypt-1.8/src/pwrng.cpp	2018-09-28 00:52:38 -0700
+@@ -23,6 +23,7 @@
+ #include "iohelpers.h"
+ #include <stdlib.h>
+ 
++#if not defined(_WIN32)
+ #if (HAVE_READPASSPHRASE == 1)
+ #include <readpassphrase.h>
+ #elif (HAVE_BSDREADPASSPHRASE == 1)
+@@ -33,9 +34,58 @@
+  * implementation from e.g. openssh's openbsd-compat and put it here. */
+ #include <unistd.h>
+ #endif
++#endif
+ 
+ #define MAX_PW_LEN 1024 //like if someone enjoyed typing that.
+ 
++// https://github.com/libarchive/libarchive/blob/master/libarchive_fe/passphrase.c
++#if defined(_WIN32)
++#include <windows.h>
++#define HAVE_READPASSPHRASE 1
++#define RPP_REQUIRE_TTY 1
++static char *
++readpassphrase(const char *prompt, char *buf, size_t bufsiz, int flags)
++{
++	HANDLE hStdin, hStdout;
++	DWORD mode, rbytes;
++	BOOL success;
++
++	(void)flags;
++
++	hStdin = GetStdHandle(STD_INPUT_HANDLE);
++	if (hStdin == INVALID_HANDLE_VALUE)
++		return (NULL);
++	hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
++	if (hStdout == INVALID_HANDLE_VALUE)
++		return (NULL);
++
++	success = GetConsoleMode(hStdin, &mode);
++	if (!success)
++		return (NULL);
++	mode &= ~ENABLE_ECHO_INPUT;
++	mode |= ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
++	success = SetConsoleMode(hStdin, mode);
++	if (!success)
++		return (NULL);
++
++	success = WriteFile(hStdout, prompt, (DWORD)strlen(prompt),
++		NULL, NULL);
++	if (!success)
++		return (NULL);
++	success = ReadFile(hStdin, buf, (DWORD)bufsiz - 1, &rbytes, NULL);
++	if (!success)
++		return (NULL);
++	WriteFile(hStdout, "\r\n", 2, NULL, NULL);
++	buf[rbytes] = '\0';
++	/* Remove trailing carriage return(s). */
++	if (rbytes > 2 && buf[rbytes - 2] == '\r' && buf[rbytes - 1] == '\n')
++		buf[rbytes - 2] = '\0';
++
++	return (buf);
++}
++#endif /* _WIN32 */
++
++
+ static bool read_password (const std::string&prompt, std::string&pw)
+ {
+ #if (HAVE_READPASSPHRASE == 1 || HAVE_BSDREADPASSPHRASE==1)
