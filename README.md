@@ -1,4 +1,5 @@
-```Binaries and patches for Codecrypt 1.8 Win32 portable executable
+```
+Binaries and patches for Codecrypt 1.8 Win32 portable executable
 Tested on a clean Windows 7 virtual machine.
 The codecrypt binary (ccr.exe) along with its .libs directory will run
 on a Windows machine without a development environment installed.
