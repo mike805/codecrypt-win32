@@ -10,6 +10,11 @@ Codecrypt will put the keys in the current directory unless you set CCR_DIR
 Minutes-long key generation is normal - it's not broken! Everything is fast
 after the key generation.
 
+The win32 version reads files in binary mode, so ASCII-armored input files
+must be in Unix format, free of DOS CR characters. Fixing this is possible
+and would require parsing input switches and deciding when to set either the
+input or the output to text mode.
+
 * codecrypt-portable-win32.zip
   Codecrypt portable executable binary package for win32
   If you just want to run codecrypt on Windows, this is the only file you need.
